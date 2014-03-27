@@ -1,5 +1,6 @@
 '''Create a Celery ABC that prevents task stacking.'''
 ## Standard Library
+import contextlib
 import inspect
 import time
 ## Third Party
@@ -34,8 +35,9 @@ class MutexTask(celery.Task):
             lock_node += u'.{}'.format(value.replace('/', u'\u2044'))
         return lock_node
 
-    def apply_async(self, args=None, kwargs=None, **options):
-        '''Apply the task asynchronously.'''
+    @contextlib.contextmanager
+    def mutex(self, args, kwargs, delete=False):
+        '''Creates the mutex locks and yields the mutex status.'''
         conf = self._get_app().conf
         global_timeout = getattr(conf, 'MUTEX_TIMEOUT', None)
         items = inspect.getcallargs(self.run, *args, **kwargs)
@@ -52,68 +54,46 @@ class MutexTask(celery.Task):
                     success = True
             else:
                 success = True
-        except Exception as exc:
+        except kazoo.exceptions.KazooException as exc:
             print 'Error stopping execution: {}'.format(exc)
-            return
+            yield False
         else:
             if success:
                 client.create(lock_node, str(time.time()), makepath=True)
-                return super(MutexTask, self).apply_async(args, kwargs,
-                                                          **options)
+                yield True
+                if delete:
+                    client.delete(lock_node)
             else:
                 print 'This task has been locked.'
-                return
+                yield False
         finally:
             try:
                 client.stop()
                 client.close()
-            except Exception:
+            except kazoo.exceptions.KazooException as exc:
                 pass
+
+    def apply_async(self, args=None, kwargs=None, **options):
+        '''Apply the task asynchronously.'''
+        with self.mutex(args, kwargs) as mutex_acquired:
+            if mutex_acquired:
+                return super(MutexTask, self).apply_async(args, kwargs,
+                                                          **options)
 
     def __call__(self, *args, **kwargs):
         '''Direct method call.'''
-        local = self.request.called_directly or self.request.is_eager
-        if local:
-            conf = self._get_app().conf
-            global_timeout = getattr(conf, 'MUTEX_TIMEOUT', None)
-            items = inspect.getcallargs(self.run, *args, **kwargs)
-            timeout = items.get('mutex_timeout') or global_timeout or 3600
-            success = False
-            try:
-                hosts = conf.ZOOKEEPER_HOSTS
-                client = kazoo.client.KazooClient(hosts=hosts)
-                client.start()
-                lock_node = self._get_node(args, kwargs)
-                if client.exists(lock_node):
-                    if time.time() - float(client.get(lock_node)[0]) > timeout:
-                        client.delete(lock_node)
-                        success = True
-                else:
-                    success = True
-            except Exception as exc:
-                print 'Error stopping execution: {}'.format(exc)
-                return
-            else:
-                if success:
-                    client.create(lock_node, str(time.time()), makepath=True)
+        if self.request.called_directly or self.request.is_eager:
+            ret = None
+            with self.mutex(args, kwargs, delete=True) as mutex_acquired:
+                if mutex_acquired:
                     ret = super(MutexTask, self).__call__(*args, **kwargs)
-                    client.delete(lock_node)
-                    return ret
-                else:
-                    print 'This task has been locked.'
-                    return
-            finally:
-                try:
-                    client.stop()
-                    client.close()
-                except Exception:
-                    pass
+            return ret
         else:
             return super(MutexTask, self).__call__(*args, **kwargs)
 
     def after_return(self, status, retval, task_id, args, kwargs, einfo):
         '''Delete lock node of task, regardles of status.'''
-        if not self.request.called_directly or self.request.is_eager:
+        if not (self.request.called_directly or self.request.is_eager):
             ## Only remove the lock if the job was not called locally
             client = None
             try:
