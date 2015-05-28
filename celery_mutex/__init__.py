@@ -6,6 +6,9 @@ import time
 ## Third Party
 import kazoo.client
 import celery
+from celery.utils.log import get_task_logger
+import six
+logger = get_task_logger(__name__)
 
 
 class MutexTask(celery.Task):
@@ -27,7 +30,7 @@ class MutexTask(celery.Task):
         mutex_keys = getattr(self, 'mutex_keys', ())
         lock_node = u'/mutex/celery/{}'.format(self.name)
         items = inspect.getcallargs(self.run, *args, **kwargs)
-        for value in (unicode(items[x]) for x in mutex_keys if items.get(x)):
+        for value in (six.text_type(items[x]) for x in mutex_keys if items.get(x)):
             ## This replace here converts a slash into a fraction-slash.
             ## They look the same but ZooKeeper uses slashes to denote a
             ## new node and since a value could contain a slash (e.g. a
@@ -55,16 +58,16 @@ class MutexTask(celery.Task):
             else:
                 success = True
         except kazoo.exceptions.KazooException as exc:
-            print 'Error stopping execution: {}'.format(exc)
+            logger.exception('Error stopping execution')
             yield False
         else:
             if success:
-                client.create(lock_node, str(time.time()), makepath=True)
+                client.create(lock_node, six.text_type(time.time()).encode(), makepath=True)
                 yield True
                 if delete:
                     client.delete(lock_node)
             else:
-                print 'This task has been locked.'
+                logger.debug('This task has been locked.')
                 yield False
         finally:
             try:
