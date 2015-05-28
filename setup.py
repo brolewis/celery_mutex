@@ -34,5 +34,8 @@ setuptools.setup(
     keywords='Celery tasks mutex',
     platforms='any',
     url='https://github.com/brolewis/celery_mutex',
-    install_requires='kazoo>=1.0'
+    install_requires=[
+        'kazoo>=1.0',
+        'six',
+    ]
 )
